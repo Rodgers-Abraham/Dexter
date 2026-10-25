@@ -1,7 +1,11 @@
-#web_search.py
+# web_search.py
+# API-based web search — no browser automation, no CAPTCHAs.
+# Priority: Gemini grounded search → DuckDuckGo API fallback.
+
 import json
 import sys
 from pathlib import Path
+
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -19,6 +23,7 @@ def _get_api_key() -> str:
 
 
 def _gemini_search(query: str) -> str:
+    """Use Gemini with Google Search grounding for real-time web results."""
     from google import genai
 
     client   = genai.Client(api_key=_get_api_key())
@@ -40,6 +45,7 @@ def _gemini_search(query: str) -> str:
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
+    """DuckDuckGo instant answers — no browser, pure API."""
     try:
         from ddgs import DDGS
     except ImportError:
@@ -68,6 +74,7 @@ def _format_ddg(query: str, results: list[dict]) -> str:
         lines.append("")
     return "\n".join(lines).strip()
 
+
 def _compare(items: list[str], aspect: str) -> str:
     query = (
         f"Compare {', '.join(items)} in terms of {aspect}. "
@@ -78,7 +85,6 @@ def _compare(items: list[str], aspect: str) -> str:
     except Exception as e:
         print(f"[WebSearch] ⚠️ Gemini compare failed: {e} — falling back to DDG")
 
-    # DDG fallback: fetch results per item and merge
     all_results: dict[str, list] = {}
     for item in items:
         try:
@@ -93,6 +99,7 @@ def _compare(items: list[str], aspect: str) -> str:
             if r.get("snippet"):
                 lines.append(f"  • {r['snippet']}")
     return "\n".join(lines)
+
 
 def web_search(
     parameters:     dict,
@@ -116,22 +123,39 @@ def web_search(
         player.write_log(f"[Search] {query or ', '.join(items)}")
 
     print(f"[WebSearch] 🔍 Query: {query!r}  Mode: {mode}")
-# replace: result = _gemini_search(query) block with:
+
+    if mode == "compare" and items:
+        try:
+            return _compare(items, aspect)
+        except Exception as e:
+            return f"Comparison failed: {e}"
+
+    # Primary: Gemini with Google Search grounding (real-time web data)
     try:
-        from or_client import client
-        result = client.chat(
-            query,
-            system="You are a web search assistant. Answer factually and concisely."
-        )
-        print("[WebSearch] ✅ OpenRouter OK.")
+        result = _gemini_search(query)
+        print("[WebSearch] ✅ Gemini grounded search OK.")
         return result
     except Exception as e:
-        print(f"[WebSearch] ⚠️ OpenRouter failed ({e}) — trying DDG...")
+        print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
+
+    # Fallback: DuckDuckGo API
+    try:
         results = _ddg_search(query)
         result  = _format_ddg(query, results)
         print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
         return result
-    
-    except Exception as e:
-        print(f"[WebSearch] ❌ All backends failed: {e}")
-        return f"Search failed, sir: {e}"
+    except Exception as e2:
+        print(f"[WebSearch] ❌ DDG also failed: {e2}")
+
+    # Last resort: OpenRouter (no internet, but can answer from training data)
+    try:
+        from or_client import client
+        result = client.chat(
+            query,
+            system="You are a helpful assistant. Answer factually and concisely based on your knowledge."
+        )
+        print("[WebSearch] ✅ OpenRouter fallback OK.")
+        return result
+    except Exception as e3:
+        print(f"[WebSearch] ❌ All backends failed: {e3}")
+        return f"Search failed, sir: {e3}"

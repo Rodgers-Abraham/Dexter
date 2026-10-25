@@ -4,147 +4,99 @@ import concurrent.futures
 import platform
 import shutil
 import subprocess
+import random
+import time
+import urllib.parse
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 
-def _get_default_browser_id() -> str:
-    """Returns raw default browser identifier string for current OS."""
-    system = platform.system()
+# ── Detect user's real default browser ────────────────────────────────────────
+
+def _get_default_browser_cmd() -> str | None:
+    """Get the default browser command on Linux."""
     try:
-        if system == "Windows":
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
-            )
-            prog_id = winreg.QueryValueEx(key, "ProgId")[0].lower()
-            winreg.CloseKey(key)
-            return prog_id
-
-        elif system == "Darwin":
-            result = subprocess.run(
-                ["defaults", "read",
-                 "com.apple.LaunchServices/com.apple.launchservices.secure",
-                 "LSHandlers"],
-                capture_output=True, text=True, timeout=5
-            )
-            return result.stdout.lower()
-
-        elif system == "Linux":
-            result = subprocess.run(
-                ["xdg-settings", "get", "default-web-browser"],
-                capture_output=True, text=True, timeout=5
-            )
-            return result.stdout.lower()
-
+        result = subprocess.run(
+            ["xdg-settings", "get", "default-web-browser"],
+            capture_output=True, text=True, timeout=5,
+        )
+        desktop_name = result.stdout.strip()  # e.g. "brave-browser.desktop"
+        if desktop_name:
+            # Strip .desktop to get the command name
+            cmd = desktop_name.replace(".desktop", "")
+            if shutil.which(cmd):
+                return cmd
+            # Try common variations
+            for variant in [cmd, cmd.lower(), cmd.replace(".", "-")]:
+                if shutil.which(variant):
+                    return variant
     except Exception:
         pass
 
-    return ""
-
-
-_BROWSER_BINARIES = {
-    "Windows": {
-        "opera":   ["opera.exe"],
-        "brave":   ["brave.exe"],
-        "vivaldi": ["vivaldi.exe"],
-        "chrome":  ["chrome.exe"],
-        "firefox": ["firefox.exe"],
-    },
-    "Darwin": {
-        "opera":   ["opera"],
-        "brave":   ["brave browser", "brave"],
-        "vivaldi": ["vivaldi"],
-        "chrome":  ["google chrome", "google-chrome"],
-        "firefox": ["firefox"],
-    },
-    "Linux": {
-        "opera":   ["opera", "opera-stable"],
-        "brave":   ["brave-browser", "brave"],
-        "vivaldi": ["vivaldi-stable", "vivaldi"],
-        "chrome":  ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"],
-        "firefox": ["firefox"],
-    },
-}
-
-
-def _get_opera_executable() -> str | None:
-    if platform.system() != "Windows":
-        return None
-    try:
-        import winreg
-        candidate_keys = [
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\opera.exe",
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\launcher.exe",
-            r"SOFTWARE\Clients\StartMenuInternet\OperaStable\shell\open\command",
-            r"SOFTWARE\Clients\StartMenuInternet\OperaGXStable\shell\open\command",
-        ]
-        for key_path in candidate_keys:
-            for hive in [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]:
-                try:
-                    key = winreg.OpenKey(hive, key_path)
-                    val = winreg.QueryValue(key, None)
-                    winreg.CloseKey(key)
-                    exe = val.strip().strip('"').split('"')[0].split(" --")[0].strip()
-                    if exe and Path(exe).exists():
-                        print(f"[Browser] 🔍 Opera found via registry: {exe}")
-                        return exe
-                except Exception:
-                    continue
-    except Exception:
-        pass
+    # Fallback: check common browsers
+    for cmd in ["brave-browser", "google-chrome-stable", "google-chrome", "firefox", "chromium-browser"]:
+        if shutil.which(cmd):
+            return cmd
     return None
 
 
-def _find_browser_executable(prog_id: str) -> tuple:
-    """
-    Returns (engine_name, exe_path, channel, is_opera).
-    is_opera=True → extra args needed to prevent private-mode launch.
-    """
-    system  = platform.system()
-    os_bins = _BROWSER_BINARIES.get(system, {})
+def _open_url_in_browser(url: str) -> str:
+    """Open a URL in the user's real default browser (not Playwright)."""
+    if not url.startswith("http"):
+        url = "https://" + url
 
-    if any(x in prog_id for x in ["firefox", "mozilla"]):
-        return "firefox", None, None, False
+    system = platform.system()
+    try:
+        if system == "Linux":
+            # Try xdg-open first (respects default browser)
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        elif system == "Darwin":
+            subprocess.Popen(["open", url])
+        elif system == "Windows":
+            subprocess.Popen(["start", url], shell=True)
+        else:
+            subprocess.Popen(["xdg-open", url])
 
-    if "safari" in prog_id:
-        return "webkit", None, None, False
+        time.sleep(1.0)
+        return f"Opened in browser: {url}"
+    except Exception as e:
+        return f"Failed to open URL: {e}"
 
-    if "edge" in prog_id:
-        return "chromium", None, "msedge", False
 
-    if "opera" in prog_id:
-        exe = _get_opera_executable()
-        if exe:
-            return "chromium", exe, None, True
-        for binary in os_bins.get("opera", []):
-            path = shutil.which(binary)
-            if path:
-                return "chromium", path, None, True
-
-    browser_patterns = {
-        "brave":   ["brave"],
-        "vivaldi": ["vivaldi"],
-        "chrome":  ["chrome"],
+def _search_in_browser(query: str, engine: str = "google") -> str:
+    """Open a search query in the user's real browser."""
+    encoded = urllib.parse.quote_plus(query)
+    engines = {
+        "google":     f"https://www.google.com/search?q={encoded}",
+        "bing":       f"https://www.bing.com/search?q={encoded}",
+        "duckduckgo": f"https://duckduckgo.com/?q={encoded}",
+        "youtube":    f"https://www.youtube.com/results?search_query={encoded}",
     }
-    for browser_name, patterns in browser_patterns.items():
-        if not any(p in prog_id for p in patterns):
-            continue
-        binaries = os_bins.get(browser_name, [])
-        for binary in binaries:
-            path = shutil.which(binary)
-            if path:
-                print(f"[Browser] 🔍 Found {browser_name} at: {path}")
-                return "chromium", path, None, False
+    url = engines.get(engine.lower(), engines["google"])
+    return _open_url_in_browser(url)
 
-    if "chrome" in prog_id or not prog_id:
-        return "chromium", None, "chrome", False
 
-    return "chromium", None, None, False
+# ── Playwright stealth browser (kept as optional fallback for automation) ─────
+
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+    _HAS_PLAYWRIGHT = True
+except ImportError:
+    _HAS_PLAYWRIGHT = False
+    PlaywrightTimeout = Exception
+
+try:
+    from playwright_stealth import Stealth
+    _HAS_STEALTH = True
+except ImportError:
+    _HAS_STEALTH = False
 
 
 class _BrowserThread:
+    """Playwright-based browser thread for advanced automation tasks only."""
 
     def __init__(self):
         self._loop       = None
@@ -154,12 +106,11 @@ class _BrowserThread:
         self._browser    = None
         self._context    = None
         self._page       = None
-        self._engine_name = "chromium"
-        self._exe_path   = None
-        self._channel    = None
-        self._is_opera   = False
 
     def start(self):
+        if not _HAS_PLAYWRIGHT:
+            print("[Browser] ⚠️ Playwright not installed — automation features disabled")
+            return
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(
@@ -184,80 +135,47 @@ class _BrowserThread:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
-    # ── Tarayıcı ve sayfa yönetimi ───────────────────────────────────────────
-
     async def _launch_browser_if_needed(self):
-        """
-        Tarayıcıyı başlatır. Zaten açıksa hiçbir şey yapmaz.
-        Her zaman default tarayıcıyı kullanır, özel sekme açmaz.
-        """
         if self._browser and self._browser.is_connected():
             return
 
-        prog_id = _get_default_browser_id()
-        self._engine_name, self._exe_path, self._channel, self._is_opera = _find_browser_executable(prog_id)
-        engine = getattr(self._playwright, self._engine_name)
-
-        # Temel chromium argümanları
-        chromium_args = ["--start-maximized"]
-
-        if self._is_opera:
-            # Opera GX bazı sürümlerde varsayılan olarak private modda başlar.
-            # Aşağıdaki flag'ler bunu engeller.
-            chromium_args += [
-                "--disable-features=OperaPrivacyMode",
-                "--no-private",
-            ]
-            print("[Browser] 🎭 Opera detected — disabling private-mode flags")
-
-        launch_kwargs = {"headless": False}
-        if self._engine_name == "chromium":
-            launch_kwargs["args"] = chromium_args
-        if self._exe_path:
-            launch_kwargs["executable_path"] = self._exe_path
-        elif self._channel:
-            launch_kwargs["channel"] = self._channel
+        engine = self._playwright.chromium
+        chromium_args = [
+            "--start-maximized",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+        ]
 
         try:
-            self._browser = await engine.launch(**launch_kwargs)
-            print(
-                f"[Browser] ✅ Launched ({self._engine_name}"
-                f"{' / ' + self._channel if self._channel else ''}"
-                f"{' / ' + self._exe_path if self._exe_path else ''})"
+            self._browser = await engine.launch(
+                headless=False,
+                args=chromium_args,
+                ignore_default_args=["--enable-automation"],
             )
         except Exception as e:
-            print(f"[Browser] ⚠️ Launch failed ({e}), falling back to built-in Chromium")
-            self._browser = await self._playwright.chromium.launch(
-                headless=False,
-                args=["--start-maximized"]
-            )
+            print(f"[Browser] ⚠️ Playwright launch failed: {e}")
+            raise
 
     async def _get_page(self):
-        """
-        Mevcut sayfayı döndürür.
-        - Tarayıcı kapalıysa açar.
-        - Context yoksa oluşturur.
-        - Sayfa kapalıysa yeni sekme açar (aynı pencerede).
-        - Sayfa zaten açıksa aynı sayfayı döndürür (yeni pencere açmaz).
-        """
         await self._launch_browser_if_needed()
 
         if self._context is None:
             self._context = await self._browser.new_context(
                 viewport=None,
                 user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "Mozilla/5.0 (X11; Linux x86_64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
             )
 
         if self._page is None or self._page.is_closed():
             self._page = await self._context.new_page()
+            if _HAS_STEALTH:
+                stealth_bot = Stealth()
+                await stealth_bot.apply_stealth_async(self._page)
 
         return self._page
-
-    # ── Eylemler ─────────────────────────────────────────────────────────────
 
     async def _go_to(self, url: str) -> str:
         if not url.startswith("http"):
@@ -270,15 +188,6 @@ class _BrowserThread:
             return f"Timeout loading: {url}"
         except Exception as e:
             return f"Navigation error: {e}"
-
-    async def _search(self, query: str, engine: str = "google") -> str:
-        engines = {
-            "google":     f"https://www.google.com/search?q={query.replace(' ', '+')}",
-            "bing":       f"https://www.bing.com/search?q={query.replace(' ', '+')}",
-            "duckduckgo": f"https://duckduckgo.com/?q={query.replace(' ', '+')}",
-        }
-        url = engines.get(engine.lower(), engines["google"])
-        return await self._go_to(url)
 
     async def _click(self, selector=None, text=None) -> str:
         page = await self._get_page()
@@ -301,7 +210,8 @@ class _BrowserThread:
             element = page.locator(selector).first if selector else page.locator(":focus")
             if clear_first:
                 await element.clear()
-            await element.type(text, delay=50)
+            delay = random.randint(50, 150)
+            await element.type(text, delay=delay)
             return "Text typed."
         except Exception as e:
             return f"Type error: {e}"
@@ -338,7 +248,8 @@ class _BrowserThread:
             try:
                 el = page.locator(selector).first
                 await el.clear()
-                await el.type(str(value), delay=40)
+                delay = random.randint(50, 150)
+                await el.type(str(value), delay=delay)
                 results.append(f"✓ {selector}")
             except Exception as e:
                 results.append(f"✗ {selector}: {e}")
@@ -349,10 +260,10 @@ class _BrowserThread:
         desc_lower = description.lower()
 
         role_hints = {
-            "button":    ["button", "buton", "btn"],
-            "link":      ["link", "bağlantı"],
-            "searchbox": ["search", "arama"],
-            "textbox":   ["input", "field", "alan"],
+            "button":    ["button", "btn"],
+            "link":      ["link"],
+            "searchbox": ["search"],
+            "textbox":   ["input", "field"],
         }
         for role, keywords in role_hints.items():
             if any(k in desc_lower for k in keywords):
@@ -387,7 +298,8 @@ class _BrowserThread:
             try:
                 el = locator.first
                 await el.clear()
-                await el.type(text, delay=50)
+                delay = random.randint(50, 150)
+                await el.type(text, delay=delay)
                 return f"Typed into ({method}): '{description}'"
             except Exception:
                 continue
@@ -408,15 +320,20 @@ class _BrowserThread:
         return "Browser closed."
 
 
-# ── Singleton browser thread ─────────────────────────────────────────────────
+# ── Singleton (lazy init — only starts when automation actions are used) ──────
 
 _bt         = _BrowserThread()
 _bt_started = False
 _bt_lock    = threading.Lock()
 
 
-def _ensure_started():
+def _ensure_playwright_started():
     global _bt_started
+    if not _HAS_PLAYWRIGHT:
+        raise RuntimeError(
+            "Playwright is not installed. Basic browser actions (open URL, search) "
+            "still work via your real browser. For advanced automation, run: pip install playwright && playwright install"
+        )
     with _bt_lock:
         if not _bt_started:
             _bt.start()
@@ -432,15 +349,21 @@ def browser_control(
     session_memory=None
 ) -> str:
     """
-    Browser controller — auto-detects and uses system default browser.
-    Always reuses the existing browser window/page; never opens incognito.
+    Browser controller.
+
+    For 'go_to' and 'search' actions: opens in the user's REAL default browser
+    (Brave, Chrome, Firefox, etc.) via xdg-open — no CAPTCHAs, no cookie popups,
+    all your logins and extensions are available.
+
+    For advanced automation actions (click, type, fill_form, smart_click, etc.):
+    uses a Playwright-controlled browser instance.
 
     parameters:
         action      : go_to | search | click | type | scroll | fill_form |
                       smart_click | smart_type | get_text | press | close
         url         : URL for go_to
         query       : search query
-        engine      : google | bing | duckduckgo (default: google)
+        engine      : google | bing | duckduckgo | youtube (default: google)
         selector    : CSS selector for click/type
         text        : text to click or type
         description : element description for smart_click/smart_type
@@ -450,66 +373,86 @@ def browser_control(
         fields      : {selector: value} dict for fill_form
         clear_first : bool, clear input before typing (default: True)
     """
-    _ensure_started()
-
-    action = (parameters or {}).get("action", "").lower().strip()
+    params = parameters or {}
+    action = params.get("action", "").lower().strip()
     result = "Unknown action."
 
     try:
+        # ── Actions that use the REAL browser (no CAPTCHA / cookies issues) ──
         if action == "go_to":
-            result = _bt.run(_bt._go_to(parameters.get("url", "")))
+            url = params.get("url", "")
+            if not url:
+                result = "No URL provided."
+            else:
+                result = _open_url_in_browser(url)
 
         elif action == "search":
-            result = _bt.run(_bt._search(
-                parameters.get("query", ""),
-                parameters.get("engine", "google"),
-            ))
+            query = params.get("query", "")
+            engine = params.get("engine", "google")
+            if not query:
+                result = "No search query provided."
+            else:
+                result = _search_in_browser(query, engine)
 
+        # ── Actions that need Playwright automation ──────────────────────────
         elif action == "click":
+            _ensure_playwright_started()
             result = _bt.run(_bt._click(
-                selector=parameters.get("selector"),
-                text=parameters.get("text"),
+                selector=params.get("selector"),
+                text=params.get("text"),
             ))
 
         elif action == "type":
+            _ensure_playwright_started()
             result = _bt.run(_bt._type(
-                selector=parameters.get("selector"),
-                text=parameters.get("text", ""),
-                clear_first=parameters.get("clear_first", True),
+                selector=params.get("selector"),
+                text=params.get("text", ""),
+                clear_first=params.get("clear_first", True),
             ))
 
         elif action == "scroll":
+            _ensure_playwright_started()
             result = _bt.run(_bt._scroll(
-                direction=parameters.get("direction", "down"),
-                amount=parameters.get("amount", 500),
+                direction=params.get("direction", "down"),
+                amount=params.get("amount", 500),
             ))
 
         elif action == "fill_form":
-            result = _bt.run(_bt._fill_form(parameters.get("fields", {})))
+            _ensure_playwright_started()
+            result = _bt.run(_bt._fill_form(params.get("fields", {})))
 
         elif action == "smart_click":
-            result = _bt.run(_bt._smart_click(parameters.get("description", "")))
+            _ensure_playwright_started()
+            result = _bt.run(_bt._smart_click(params.get("description", "")))
 
         elif action == "smart_type":
+            _ensure_playwright_started()
             result = _bt.run(_bt._smart_type(
-                parameters.get("description", ""),
-                parameters.get("text", ""),
+                params.get("description", ""),
+                params.get("text", ""),
             ))
 
         elif action == "get_text":
+            _ensure_playwright_started()
             result = _bt.run(_bt._get_text())
 
         elif action == "press":
-            result = _bt.run(_bt._press(parameters.get("key", "Enter")))
+            _ensure_playwright_started()
+            result = _bt.run(_bt._press(params.get("key", "Enter")))
 
         elif action == "close":
-            result = _bt.run(_bt._close_browser())
+            if _bt_started:
+                result = _bt.run(_bt._close_browser())
+            else:
+                result = "No automation browser is open."
 
         else:
             result = f"Unknown action: {action}"
 
     except concurrent.futures.TimeoutError:
         result = "Browser action timed out."
+    except RuntimeError as e:
+        result = str(e)
     except Exception as e:
         result = f"Browser error: {e}"
 

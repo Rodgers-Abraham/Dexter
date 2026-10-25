@@ -12,7 +12,7 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
     _PYAUTOGUI = False
 
 try:
@@ -161,6 +161,67 @@ def brightness_down():
             )
         except Exception as e:
             print(f"[Settings] Brightness down failed on Windows: {e}")
+
+def kill_app_by_name(app_name: str) -> bool:
+    import psutil
+    app_name = app_name.lower().strip()
+    # Map common user terms to process names
+    aliases = {
+        "vscode": ["code"],
+        "vs code": ["code"],
+        "visual studio code": ["code"],
+        "visual studio": ["code"], # Handle VS Code requested as Visual Studio
+        "spotify": ["spotify"],
+        "chrome": ["chrome", "google-chrome"],
+        "google chrome": ["chrome", "google-chrome"],
+        "brave": ["brave"],
+        "brave browser": ["brave"],
+        "firefox": ["firefox"],
+        "rhythmbox": ["rhythmbox"],
+        "discord": ["discord"],
+        "telegram": ["telegram"],
+        "whatsapp": ["whatsapp"],
+        "steam": ["steam"],
+    }
+    targets = aliases.get(app_name, [app_name])
+    
+    import os
+    excluded_pids = {os.getpid()}
+    try:
+        curr = psutil.Process(os.getpid())
+        while curr.parent():
+            curr = curr.parent()
+            excluded_pids.add(curr.pid)
+    except Exception:
+        pass
+
+    killed = False
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            pinfo = proc.info
+            pid = pinfo['pid']
+            if pid in excluded_pids:
+                continue
+                
+            pname = (pinfo['name'] or "").lower()
+            cmdline = " ".join(pinfo['cmdline'] or []).lower()
+            
+            # Avoid killing active dev agent tools or python runners
+            if any(term in cmdline for term in ("antigravity", "gemini-agent", "agent_runner")):
+                continue
+
+            for target in targets:
+                if target in pname or target in cmdline:
+                    proc.terminate()
+                    # Give it a short moment to terminate, then kill if alive
+                    try:
+                        proc.wait(timeout=0.5)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    killed = True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return killed
 
 def close_app():
     if _OS == "Darwin": pyautogui.hotkey("command", "q")
@@ -497,6 +558,185 @@ def shutdown_computer():
     else:
         subprocess.run(["systemctl", "poweroff"], capture_output=True)
 
+def control_mpris_player(action: str, player_name: str = "spotify") -> str:
+    try:
+        import dbus
+    except ImportError:
+        return "D-Bus python library is not available."
+        
+    try:
+        bus = dbus.SessionBus()
+        players = [name for name in bus.list_names() if name.startswith("org.mpris.MediaPlayer2.")]
+        
+        target_player = None
+        if player_name:
+            for p in players:
+                if player_name.lower() in p.lower():
+                    target_player = p
+                    break
+        
+        if not target_player and players:
+            target_player = players[0]
+            
+        if not target_player:
+            return f"No active media player found matching '{player_name or 'any'}'. Please make sure it is running."
+            
+        player_obj = bus.get_object(target_player, "/org/mpris/MediaPlayer2")
+        player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
+        
+        if action == "play":
+            player_iface.Play()
+            return f"Playing on {target_player.split('.')[-1]}"
+        elif action == "pause":
+            player_iface.Pause()
+            return f"Paused on {target_player.split('.')[-1]}"
+        elif action == "play_pause":
+            player_iface.PlayPause()
+            return f"Toggled play/pause on {target_player.split('.')[-1]}"
+        elif action == "next":
+            player_iface.Next()
+            return f"Skipped to next on {target_player.split('.')[-1]}"
+        elif action == "prev":
+            player_iface.Previous()
+            return f"Skipped to previous on {target_player.split('.')[-1]}"
+        elif action == "stop":
+            player_iface.Stop()
+            return f"Stopped play on {target_player.split('.')[-1]}"
+        elif action == "status":
+            props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
+            playback_status = props_iface.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+            metadata = props_iface.Get("org.mpris.MediaPlayer2.Player", "Metadata")
+            
+            title = metadata.get("xesam:title", "Unknown Title")
+            artist = ", ".join(metadata.get("xesam:artist", ["Unknown Artist"]))
+            album = metadata.get("xesam:album", "Unknown Album")
+            return f"Status: {playback_status} | Song: {title} | Artist: {artist} | Album: {album}"
+        else:
+            return f"Unknown media action: {action}"
+    except Exception as e:
+        return f"D-Bus control failed: {e}"
+
+def send_email(to_email: str, subject: str, body: str) -> str:
+    import smtplib
+    from email.mime.text import MIMEText
+    
+    api_key_path = _get_base_dir() / "config" / "api_keys.json"
+    try:
+        with open(api_key_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        return f"Could not load api_keys.json: {e}"
+        
+    sender_email = config.get("email_address")
+    sender_password = config.get("email_password")
+    smtp_server = config.get("email_smtp_server", "smtp.gmail.com")
+    smtp_port = int(config.get("email_smtp_port", 587))
+    
+    if not sender_email or not sender_password:
+        return (
+            "Email credentials are not configured. Please add the following fields to your config "
+            "(/home/Twitch/Projects/Jarvis/config/api_keys.json):\n"
+            '  "email_address": "your_email@gmail.com",\n'
+            '  "email_password": "your_app_password",\n'
+            '  "email_smtp_server": "smtp.gmail.com",\n'
+            '  "email_smtp_port": 587\n'
+            "(For Gmail, make sure to generate an App Password in your Google Account settings)."
+        )
+        
+    try:
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = sender_email
+        msg['To'] = to_email
+        
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.sendmail(sender_email, [to_email], msg.as_string())
+        server.quit()
+        
+        return f"Email successfully sent to {to_email}."
+    except Exception as e:
+        return f"Failed to send email: {e}"
+
+def read_emails(count: int = 5) -> str:
+    import imaplib
+    import email
+    from email.header import decode_header
+    
+    api_key_path = _get_base_dir() / "config" / "api_keys.json"
+    try:
+        with open(api_key_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        return f"Could not load api_keys.json: {e}"
+        
+    user_email = config.get("email_address")
+    password = config.get("email_password")
+    imap_server = config.get("email_imap_server", "imap.gmail.com")
+    
+    if not user_email or not password:
+        return (
+            "Email credentials are not configured. Please add the following fields to your config "
+            "(/home/Twitch/Projects/Jarvis/config/api_keys.json):\n"
+            '  "email_address": "your_email@gmail.com",\n'
+            '  "email_password": "your_app_password",\n'
+            '  "email_imap_server": "imap.gmail.com"\n'
+            "(For Gmail, make sure to generate an App Password in your Google Account settings)."
+        )
+        
+    try:
+        mail = imaplib.IMAP4_SSL(imap_server)
+        mail.login(user_email, password)
+        mail.select("inbox")
+        
+        status, messages = mail.search(None, "ALL")
+        if status != "OK":
+            return "Failed to search inbox."
+            
+        mail_ids = messages[0].split()
+        if not mail_ids:
+            return "Inbox is empty."
+            
+        latest_ids = mail_ids[-count:]
+        latest_ids.reverse()
+        
+        results = []
+        for index, mail_id in enumerate(latest_ids):
+            status, data = mail.fetch(mail_id, "(RFC822)")
+            if status != "OK":
+                continue
+                
+            raw_email = data[0][1]
+            msg = email.message_from_bytes(raw_email)
+            
+            subject, encoding = decode_header(msg["Subject"] or "")[0]
+            if isinstance(subject, bytes):
+                subject = subject.decode(encoding or "utf-8", errors="ignore")
+                
+            from_sender, encoding = decode_header(msg["From"] or "")[0]
+            if isinstance(from_sender, bytes):
+                from_sender = from_sender.decode(encoding or "utf-8", errors="ignore")
+                
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disp = str(part.get("Content-Disposition"))
+                    if content_type == "text/plain" and "attachment" not in content_disp:
+                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                
+            snippet = body.strip().replace("\n", " ")[:120]
+            results.append(f"[{index+1}] From: {from_sender}\n    Subject: {subject}\n    Preview: {snippet}...")
+            
+        mail.logout()
+        return "\n\n".join(results)
+    except Exception as e:
+        return f"Failed to read emails: {e}"
+
 ACTION_MAP: dict[str, callable] = {
     "volume_up":           volume_up,
     "volume_down":         volume_down,
@@ -557,6 +797,17 @@ ACTION_MAP: dict[str, callable] = {
     "toggle_wifi":         toggle_wifi,
     "restart":             restart_computer,
     "shutdown":            shutdown_computer,
+    "spotify_play":        lambda: control_mpris_player("play", "spotify"),
+    "spotify_pause":       lambda: control_mpris_player("pause", "spotify"),
+    "spotify_next":        lambda: control_mpris_player("next", "spotify"),
+    "spotify_prev":        lambda: control_mpris_player("prev", "spotify"),
+    "spotify_status":      lambda: control_mpris_player("status", "spotify"),
+    "media_play":          lambda: control_mpris_player("play", ""),
+    "media_pause":         lambda: control_mpris_player("pause", ""),
+    "media_play_pause":    lambda: control_mpris_player("play_pause", ""),
+    "media_next":          lambda: control_mpris_player("next", ""),
+    "media_prev":          lambda: control_mpris_player("prev", ""),
+    "media_status":        lambda: control_mpris_player("status", ""),
 }
 
 _DANGEROUS_ACTIONS = {"restart", "shutdown"}
@@ -622,6 +873,70 @@ def computer_settings(
                 f"This will {action} the computer. "
                 f"Please confirm by calling again with confirmed=yes."
             )
+
+    if action == "close":
+        action = "close_app"
+
+    if action == "close_app":
+        app_name = description or value
+        if app_name:
+            try:
+                success = kill_app_by_name(app_name)
+                if success:
+                    return f"Closed application: {app_name}."
+                else:
+                    close_app()
+                    return f"Attempted to close application: {app_name} (fallback to active window close)."
+            except Exception as e:
+                close_app()
+                return f"Attempted to close active window (kill failed for '{app_name}': {e})."
+        else:
+            close_app()
+            return "Closed active application."
+
+    if action == "email_send":
+        to_email = params.get("to") or value
+        subject = params.get("subject")
+        body = params.get("body")
+        
+        if not to_email or not body:
+            desc = description or ""
+            import re
+            to_match = re.search(r'(?:to|recipient):\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', desc, re.IGNORECASE)
+            sub_match = re.search(r'subject:\s*(.*?)(?=\s*(?:body|to|recipient):|$)', desc, re.IGNORECASE)
+            body_match = re.search(r'body:\s*(.*?)(?=\s*(?:subject|to|recipient):|$)', desc, re.IGNORECASE)
+            
+            if to_match: to_email = to_match.group(1).strip()
+            if sub_match: subject = sub_match.group(1).strip()
+            if body_match: body = body_match.group(1).strip()
+            
+            if not to_email:
+                emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', desc)
+                if emails:
+                    to_email = emails[0]
+            if not subject:
+                subject = "Message from Dexter"
+            if not body:
+                body = desc
+                
+        if not to_email:
+            return "Could not determine recipient email address. Please specify recipient."
+        if not body:
+            return "Could not determine email body. Please specify body."
+            
+        return send_email(to_email, subject or "Message from Dexter", body)
+
+    if action == "email_read":
+        count = 5
+        val_str = str(value or "").strip()
+        if val_str.isdigit():
+            count = int(val_str)
+        else:
+            import re
+            count_match = re.search(r'(\d+)\s*emails?', description or "", re.IGNORECASE)
+            if count_match:
+                count = int(count_match.group(1))
+        return read_emails(count)
 
     if action == "volume_set":
         try:

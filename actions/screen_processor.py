@@ -41,7 +41,7 @@ IMG_MAX_H = 360
 JPEG_Q    = 55
 
 SYSTEM_PROMPT = (
-    "You are JARVIS from Iron Man movies. "
+    "You are DEXTER from Iron Man movies. "
     "Analyze images with technical precision and intelligence. "
     "Help the user in a way they can understand — don't be overly complex. "
     "Be concise, smart, and helpful like Tony Stark's AI assistant. "
@@ -116,11 +116,149 @@ def _to_jpeg(img_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+def _capture_portal_screenshot(timeout_sec=15) -> bytes | None:
+    try:
+        import dbus
+        import dbus.mainloop.glib
+        from gi.repository import GLib
+        import random
+        import os
+    except ImportError as e:
+        print(f"[ScreenProcess] DBus or GLib not available for portal: {e}")
+        return None
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    
+    loop = GLib.MainLoop()
+    result = {"uri": None, "error": None}
+    
+    token = f"dexter_screenshot_{random.randint(1000, 9999)}"
+    connection_name = bus.get_unique_name().replace(".", "_").replace(":", "_")
+    request_path = f"/org/freedesktop/portal/desktop/request/{connection_name}/{token}"
+    
+    def on_response(response_code, results):
+        if response_code == 0:
+            result["uri"] = results.get("uri")
+        else:
+            result["error"] = f"User denied or error code: {response_code}"
+        loop.quit()
+        
+    receiver = bus.add_signal_receiver(
+        on_response,
+        signal_name="Response",
+        dbus_interface="org.freedesktop.portal.Request",
+        bus_name="org.freedesktop.portal.Desktop",
+        path=request_path
+    )
+    
+    try:
+        portal_obj = bus.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+        iface = dbus.Interface(portal_obj, "org.freedesktop.portal.Screenshot")
+        
+        options = {
+            "interactive": dbus.Boolean(False),
+            "handle_token": dbus.String(token)
+        }
+        
+        iface.Screenshot("", options)
+    except Exception as e:
+        result["error"] = f"DBus call failed: {e}"
+        receiver.remove()
+        return None
+        
+    def on_timeout():
+        result["error"] = "Timeout waiting for screenshot authorization."
+        loop.quit()
+        return False
+        
+    GLib.timeout_add(int(timeout_sec * 1000), on_timeout)
+    loop.run()
+    receiver.remove()
+    
+    if result["uri"]:
+        uri = str(result["uri"])
+        if uri.startswith("file://"):
+            filepath = uri[7:]
+            if os.path.exists(filepath):
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+                return data
+    else:
+        print(f"[ScreenshotPortal] Error: {result['error']}")
+    return None
+
 def _capture_screenshot() -> bytes:
-    with mss.mss() as sct:
-        shot      = sct.grab(sct.monitors[1])
-        png_bytes = mss.tools.to_png(shot.rgb, shot.size)
-    return _to_jpeg(png_bytes)
+    import shutil
+    import subprocess
+    import os
+
+    # A helper to check if image is likely blank (solid color / black) based on size
+    def is_likely_blank(data: bytes) -> bool:
+        return len(data) < 15000
+
+    # 1. Try silent gnome-screenshot first if installed
+    if shutil.which("gnome-screenshot"):
+        try:
+            tmp_path = "/tmp/dexter_screen.png"
+            if os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except Exception: pass
+            
+            # Run gnome-screenshot
+            subprocess.run(["gnome-screenshot", "-f", tmp_path], check=True, capture_output=True, timeout=5)
+            if os.path.exists(tmp_path):
+                with open(tmp_path, "rb") as f:
+                    png_data = f.read()
+                try: os.remove(tmp_path)
+                except Exception: pass
+                
+                jpeg_data = _to_jpeg(png_data)
+                if not is_likely_blank(jpeg_data):
+                    print("[ScreenProcess] 🖥️ Screen captured silently via gnome-screenshot")
+                    return jpeg_data
+        except Exception as e:
+            print(f"[ScreenProcess] gnome-screenshot failed: {e}")
+
+    # 2. Try mss (very fast, silent, works on X11 and Xwayland windows)
+    try:
+        with mss.mss() as sct:
+            shot      = sct.grab(sct.monitors[1])
+            png_bytes = mss.tools.to_png(shot.rgb, shot.size)
+        jpeg_data = _to_jpeg(png_bytes)
+        
+        # If it is not blank, return it directly!
+        if not is_likely_blank(jpeg_data):
+            print("[ScreenProcess] 🖥️ Screen captured via mss")
+            return jpeg_data
+    except Exception as e:
+        print(f"[ScreenProcess] mss capture failed: {e}")
+
+    # 3. Fallback to Portal Screenshot (prompts user on Wayland/X11)
+    print("[ScreenProcess] Xwayland screen capture was blank or failed. Requesting Wayland desktop portal screenshot...")
+    try:
+        portal_data = _capture_portal_screenshot()
+        if portal_data:
+            jpeg_data = _to_jpeg(portal_data)
+            print("[ScreenProcess] 🖥️ Screen captured via XDG Desktop Portal")
+            return jpeg_data
+    except Exception as e:
+        print(f"[ScreenProcess] XDG Portal screenshot failed: {e}")
+
+    # 4. Ultimate fallback: return whatever mss captured even if it is blank/black
+    print("[ScreenProcess] Portal screenshot failed or timed out. Returning mss buffer as fallback.")
+    try:
+        with mss.mss() as sct:
+            shot      = sct.grab(sct.monitors[1])
+            png_bytes = mss.tools.to_png(shot.rgb, shot.size)
+        return _to_jpeg(png_bytes)
+    except Exception:
+        # If even mss fails completely, return a small 1x1 black pixel to avoid crash
+        return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
 
 
 def _capture_camera() -> bytes:
@@ -253,7 +391,7 @@ class _LiveSession:
                     if transcript_buf and self._player:
                         full = re.sub(r'\s+', ' ', " ".join(transcript_buf)).strip()
                         if full:
-                            self._player.write_log(f"Jarvis: {full}")
+                            self._player.write_log(f"Dexter: {full}")
                             print(f"[ScreenProcess] 💬 {full}")
                     transcript_buf = []
         except Exception as e:

@@ -1,12 +1,12 @@
 import json
 import sys
-import time
 import base64
 import logging
 from pathlib import Path
 from typing import Optional
 
-import requests
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrouter_client")
@@ -16,7 +16,6 @@ def _get_base_dir() -> Path:
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
-
 BASE_DIR     = _get_base_dir()
 API_KEY_PATH = BASE_DIR / "config" / "api_keys.json"
 
@@ -24,195 +23,70 @@ def _load_api_key() -> str:
     try:
         with open(API_KEY_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        key = data.get("openrouter_api_key", "").strip()
+        key = data.get("gemini_api_key", "").strip()
         if not key:
-            raise ValueError("openrouter_api_key is empty in api_keys.json")
+            raise ValueError("gemini_api_key is empty in api_keys.json")
         return key
     except FileNotFoundError:
         raise RuntimeError(f"api_keys.json not found at: {API_KEY_PATH}")
     except Exception as e:
-        raise RuntimeError(f"Failed to load OpenRouter API key: {e}")
+        raise RuntimeError(f"Failed to load Gemini API key: {e}")
 
-TEXT_MODELS: list[str] = [
-    
-"liquid/lfm-2.5-1.2b-instruct:free",
-"liquid/lfm-2.5-1.2b-thinking:free",
-"meta-llama/llama-3.2-3b-instruct:free",
-"google/gemma-3n-e2b-it:free",
-"google/gemma-3-4b-it:free",
-"nvidia/nemotron-nano-9b-v2:free",
-"nvidia/nemotron-nano-12b-v2-vl:free",
-"nvidia/nemotron-3-nano-30b-a3b:free",
-"google/gemma-3n-e4b-it:free",
-"google/gemma-3-12b-it:free",
-"cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-"minimax/minimax-m2.5:free",
-"qwen/qwen3-coder:free",
-"google/gemma-3-27b-it:free",
-"google/gemma-4-26b-a4b-it:free",
-"google/gemma-4-31b-it:free",
-"meta-llama/llama-3.3-70b-instruct:free",
-"nousresearch/hermes-3-llama-3.1-405b:free",
-"nvidia/nemotron-3-super-120b-a12b:free",
-"arcee-ai/trinity-large-preview:free",
-"z-ai/glm-4.5-air:free"
-]
-
-VISION_MODELS: list[str] = [
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/llama-nemotron-embed-vl-1b-v2:free",
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-3n-e4b-it:free",
-    "google/gemma-3n-e2b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-]
-
-API_URL               = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MAX_TOKENS    = 512
-DEFAULT_TEMPERATURE   = 0.6
-REQUEST_TIMEOUT       = 20   # seconds per request
-MAX_RETRIES_PER_MODEL = 1    # attempts before moving to next model
-RETRY_DELAY           = 2    # seconds between retries
-RATE_LIMIT_COOLDOWN   = 60   # seconds before retrying a rate-limited model
-
-_rate_limited: dict[str, float] = {}
+DEFAULT_MODEL       = "gemini-2.5-flash"
+DEFAULT_MAX_TOKENS  = 1024
+DEFAULT_TEMPERATURE = 0.6
 
 class OpenRouterClient:
-
     def __init__(self) -> None:
-        self.api_key  = _load_api_key()
-        self._headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/mark-xxv",
-            "X-Title":       "MARK XXV",
-        }
+        self.api_key = _load_api_key()
+        self.client  = genai.Client(api_key=self.api_key)
 
-    def _is_rate_limited(self, model: str) -> bool:
-        ts = _rate_limited.get(model)
-        if ts is None:
-            return False
-        if time.time() - ts > RATE_LIMIT_COOLDOWN:
-            del _rate_limited[model]
-            return False
-        return True
-
-    def _mark_rate_limited(self, model: str) -> None:
-        _rate_limited[model] = time.time()
-        logger.warning(
-            f"[OpenRouter] Rate limited: {model} — "
-            f"cooling down for {RATE_LIMIT_COOLDOWN}s"
-        )
-
-    def _call(
-        self,
-        model: str,
-        messages: list[dict],
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = DEFAULT_TEMPERATURE,
-        response_format: Optional[dict] = None,
-    ) -> Optional[str]:
-        payload: dict = {
-            "model":       model,
-            "messages":    messages,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
-        }
-        if response_format:
-            payload["response_format"] = response_format
-
-        for attempt in range(1, MAX_RETRIES_PER_MODEL + 1):
-            try:
-                resp = requests.post(
-                    API_URL,
-                    headers=self._headers,
-                    json=payload,
-                    timeout=REQUEST_TIMEOUT,
+    def _convert_messages(self, messages: list[dict]) -> tuple[Optional[str], list[types.Content]]:
+        system_instruction = None
+        contents = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            
+            if role == "system":
+                if system_instruction:
+                    system_instruction += "\n" + content
+                else:
+                    system_instruction = content
+            else:
+                g_role = "model" if role == "assistant" else "user"
+                contents.append(
+                    types.Content(role=g_role, parts=[types.Part.from_text(text=str(content))])
                 )
-
-                if resp.status_code == 429:
-                    self._mark_rate_limited(model)
-                    return None
-
-                if resp.status_code == 200:
-                    data    = resp.json()
-                    content = (
-                        data.get("choices", [{}])[0]
-                            .get("message", {})
-                            .get("content", "")
-                    )
-                    return content.strip() if content else None
-
-                logger.warning(
-                    f"[OpenRouter] {model} → HTTP {resp.status_code} "
-                    f"(attempt {attempt}/{MAX_RETRIES_PER_MODEL})"
-                )
-
-            except requests.exceptions.Timeout:
-                logger.warning(
-                    f"[OpenRouter] {model} → Timeout "
-                    f"(attempt {attempt}/{MAX_RETRIES_PER_MODEL})"
-                )
-            except Exception as e:
-                logger.error(f"[OpenRouter] {model} → Unexpected error: {e}")
-
-            if attempt < MAX_RETRIES_PER_MODEL:
-                time.sleep(RETRY_DELAY)
-
-        return None
-
-    def _call_with_fallback(
-        self,
-        pool: list[str],
-        messages: list[dict],
-        model: Optional[str] = None,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = DEFAULT_TEMPERATURE,
-        response_format: Optional[dict] = None,
-    ) -> str:
-        if model and not self._is_rate_limited(model):
-            result = self._call(model, messages, max_tokens, temperature, response_format)
-            if result:
-                return result
-            logger.info(
-                f"[OpenRouter] Requested model failed, "
-                f"falling back to pool: {model}"
-            )
-
-        for m in pool:
-            if self._is_rate_limited(m):
-                continue
-            logger.info(f"[OpenRouter] Trying: {m}")
-            result = self._call(m, messages, max_tokens, temperature, response_format)
-            if result:
-                logger.info(f"[OpenRouter] ✓ Success: {m}")
-                return result
-
-        raise RuntimeError(
-            "[OpenRouter] All models failed or are rate-limited. "
-            "Check your API key and network connection."
-        )
+                
+        return system_instruction, contents
 
     def chat(
         self,
         prompt: str,
         system: str = (
-            "You are a component of MARK XXV, an AI assistant inspired by JARVIS. "
+            "You are a component of MARK XXV, an AI assistant inspired by DEXTER. "
             "Be concise, helpful, and precise."
         ),
         model: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = DEFAULT_TEMPERATURE,
     ) -> str:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt},
-        ]
-        return self._call_with_fallback(
-            TEXT_MODELS, messages, model, max_tokens, temperature
-        )
+        logger.info(f"[Gemini] Sending chat request (prompt length: {len(prompt)})")
+        try:
+            resp = self.client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            return resp.text.strip()
+        except Exception as e:
+            logger.error(f"[Gemini] Chat failed: {e}")
+            raise RuntimeError(f"Gemini API error: {e}")
 
     def chat_json(
         self,
@@ -224,33 +98,22 @@ class OpenRouterClient:
         model: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> dict:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt},
-        ]
-        raw = self._call_with_fallback(
-            TEXT_MODELS, messages, model, max_tokens, temperature=0.2
-        )
-
-        clean = raw.strip()
-        if clean.startswith("```"):
-            parts = clean.split("```")
-            clean = parts[1] if len(parts) > 1 else clean
-            if clean.startswith("json"):
-                clean = clean[4:]
-        clean = clean.strip().rstrip("`").strip()
-
+        logger.info(f"[Gemini] Sending JSON chat request")
         try:
-            return json.loads(clean)
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"[OpenRouter] JSON parse failed: {e}\n"
-                f"Raw response (first 300 chars): {raw[:300]}"
+            resp = self.client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.2,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                )
             )
-            raise ValueError(
-                f"Model returned unparseable JSON: {e}\n"
-                f"Raw output: {raw[:200]}"
-            )
+            return json.loads(resp.text.strip())
+        except Exception as e:
+            logger.error(f"[Gemini] JSON Chat failed: {e}")
+            raise ValueError(f"Gemini JSON parse failed: {e}")
 
     def vision(
         self,
@@ -261,24 +124,25 @@ class OpenRouterClient:
         model: Optional[str] = None,
         max_tokens: int = 1024,
     ) -> str:
-        messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{image_b64}"
-                        },
-                    },
-                    {"type": "text", "text": prompt},
+        logger.info(f"[Gemini] Sending vision request")
+        try:
+            img_bytes = base64.b64decode(image_b64)
+            resp = self.client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type=mime),
+                    prompt
                 ],
-            },
-        ]
-        return self._call_with_fallback(
-            VISION_MODELS, messages, model, max_tokens, temperature=0.2
-        )
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.2,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            return resp.text.strip()
+        except Exception as e:
+            logger.error(f"[Gemini] Vision failed: {e}")
+            raise RuntimeError(f"Gemini API error: {e}")
 
     def vision_from_file(
         self,
@@ -310,25 +174,40 @@ class OpenRouterClient:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = DEFAULT_TEMPERATURE,
     ) -> str:
-    
-        return self._call_with_fallback(
-            TEXT_MODELS, messages, model, max_tokens, temperature
-        )
+        logger.info(f"[Gemini] Sending multi-turn request ({len(messages)} messages)")
+        try:
+            system_instruction, contents = self._convert_messages(messages)
+            config = types.GenerateContentConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
+            if system_instruction:
+                config.system_instruction = system_instruction
+                
+            resp = self.client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=contents,
+                config=config,
+            )
+            return resp.text.strip()
+        except Exception as e:
+            logger.error(f"[Gemini] Multi-turn failed: {e}")
+            raise RuntimeError(f"Gemini API error: {e}")
 
     def available_models(self) -> dict:
         return {
-            "text_models":   TEXT_MODELS,
-            "vision_models": VISION_MODELS,
-            "rate_limited":  list(_rate_limited.keys()),
-            "total_text":    len(TEXT_MODELS),
-            "total_vision":  len(VISION_MODELS),
+            "text_models":   [DEFAULT_MODEL],
+            "vision_models": [DEFAULT_MODEL],
+            "rate_limited":  [],
+            "total_text":    1,
+            "total_vision":  1,
         }
 
 client = OpenRouterClient()
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  MARK XXV — OpenRouter Client Self-Test")
+    print("  MARK XXV — Gemini Client Self-Test")
     print("=" * 55)
 
     print("\n[TEST 1] Basic chat...")

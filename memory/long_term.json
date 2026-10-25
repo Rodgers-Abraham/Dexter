@@ -1,0 +1,64 @@
+{
+  "identity": {
+    "user_nickname": {
+      "value": "papi",
+      "updated": "2026-06-12"
+    },
+    "kasongo_reference": {
+      "value": "Kasongo wa Kenya",
+      "updated": "2026-06-12"
+    },
+    "kasongo_full_name": {
+      "value": "Kasongo William Ruto (Kaongo)",
+      "updated": "2026-06-12"
+    },
+    "university": {
+      "value": "University of Embu",
+      "updated": "2026-08-16"
+    },
+    "role": {
+      "value": "student",
+      "updated": "2026-08-16"
+    },
+    "nickname": {
+      "value": "Pappy",
+      "updated": "2026-08-16"
+    },
+    "full_name": {
+      "value": "Rodgers abraham",
+      "updated": "2026-08-16"
+    }
+  },
+  "preferences": {
+    "favorite_football_team": {
+      "value": "Manchester United",
+      "updated": "2026-08-16"
+    }
+  },
+  "projects": {
+    "agricultural_hackathon_maringa": {
+      "value": "Agricultural hackathon proposal for Maringa school, scheduled for next month.",
+      "updated": "2026-08-16"
+    },
+    "agricultural_hackathon_proposal": {
+      "value": "agricultural hackathon proposal",
+      "updated": "2026-08-16"
+    },
+    "agricultural_hackathon_due": {
+      "value": "September",
+      "updated": "2026-08-16"
+    },
+    "agricultural_hackathon_next_steps": {
+      "value": "Finalize budget and research planning",
+      "updated": "2026-08-16"
+    }
+  },
+  "relationships": {},
+  "wishes": {},
+  "notes": {
+    "asked_sports_news": {
+      "value": "F1",
+      "updated": "2026-08-16"
+    }
+  }
+}

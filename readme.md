@@ -1,4 +1,4 @@
-# 🤖 [ JARVIS ]
+# 🤖 [ DEXTER ]
 ### The Ultimate Cross-Platform Personal AI Assistant — By Pappy
 
 
@@ -8,7 +8,7 @@ A real-time voice AI that can hear, see, understand, and control your computer �
 
 ## ✨ Overview
 
-JARVIS represents the pinnacle of the Jarvis series, evolving into a more flexible and robust system. It bridges the gap between the operating system and human intent. Through natural dialogue, Mark 39 analyzes your screen, processes uploaded documents, and executes complex workflows with a brand-new, adaptive interface.
+DEXTER represents the pinnacle of the Dexter series, evolving into a more flexible and robust system. It bridges the gap between the operating system and human intent. Through natural dialogue, Mark 39 analyzes your screen, processes uploaded documents, and executes complex workflows with a brand-new, adaptive interface.
 
 It's not just an assistant — it's an extension of your digital life.
 
@@ -72,7 +72,7 @@ Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licens
 
 ## 👤 Connect with the Creator
 
-Engineered by a developer building a real-world JARVIS-style assistant.
+Engineered by a developer building a real-world DEXTER-style assistant.
 ⭐ **Star the repository to support the journey to Mark 100.**
 
 | Platform | Link |

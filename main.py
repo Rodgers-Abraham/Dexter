@@ -1,5 +1,7 @@
 import asyncio
 import threading
+import queue
+import time
 import json
 import sys
 import traceback
@@ -8,11 +10,12 @@ from pathlib import Path
 import sounddevice as sd
 from google import genai
 from google.genai import types
-from ui import JarvisUI
+from ui import DexterUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     should_extract_memory, extract_memory
 )
+from actions.terminal_control import run_terminal_command
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -59,18 +62,28 @@ def _load_system_prompt() -> str:
         return PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         return (
-            "You are JARVIS, Tony Stark's AI assistant. "
+            "You are DEXTER, Tony Stark's AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
-    
+
+def _push_realtime_audio(q, item):
+    try:
+        q.put_nowait(item)
+    except asyncio.QueueFull:
+        try:
+            q.get_nowait()
+            q.put_nowait(item)
+        except Exception:
+            pass
+
 _last_memory_input = ""
 
-def _update_memory_async(user_text: str, jarvis_text: str) -> None:
+def _update_memory_async(user_text: str, dexter_text: str) -> None:
     global _last_memory_input
 
     user_text   = (user_text   or "").strip()
-    jarvis_text = (jarvis_text or "").strip()
+    dexter_text = (dexter_text or "").strip()
 
     if len(user_text) < 5 or user_text == _last_memory_input:
         return
@@ -78,9 +91,9 @@ def _update_memory_async(user_text: str, jarvis_text: str) -> None:
 
     try:
         api_key = _get_api_key()
-        if not should_extract_memory(user_text, jarvis_text, api_key):
+        if not should_extract_memory(user_text, dexter_text, api_key):
             return
-        data = extract_memory(user_text, jarvis_text, api_key)
+        data = extract_memory(user_text, dexter_text, api_key)
         if data:
             update_memory(data)
             print(f"[Memory] ✅ {list(data.keys())}")
@@ -199,7 +212,9 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
             "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
-            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
+            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page, "
+            "controlling Spotify/media players (actions: spotify_play, spotify_pause, spotify_next, spotify_prev, spotify_status, media_play, media_pause, media_play_pause, media_next, media_prev, media_status), "
+            "and sending/reading emails (actions: email_send, email_read). "
             "Use for ANY single computer control command. NEVER route to agent_task."
         ),
         "parameters": {
@@ -447,17 +462,36 @@ TOOL_DECLARATIONS = [
     }
 },
     {
-    "name": "shutdown_jarvis",
+    "name": "shutdown_dexter",
     "description": (
         "Shuts down the assistant completely. "
         "Call this when the user expresses intent to end the conversation, "
-        "close the assistant, say goodbye, or stop Jarvis. "
+        "close the assistant, say goodbye, or stop Dexter. "
         "The user can say this in ANY language."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {},
     }
+    },
+    {
+        "name": "run_terminal_command",
+        "description": (
+            "Executes any bash shell command on the user's Linux system. "
+            "Use this for: playing music, writing emails, starting local programs, "
+            "compiling/running code, reading system files, or any shell tasks. "
+            "Always report the output of the command back to the user."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "command": {
+                    "type": "STRING",
+                    "description": "The exact shell command to run (e.g. 'ls -la', 'play song.mp3', 'xdg-open https://gmail.com')"
+                }
+            },
+            "required": ["command"]
+        }
     },
     {
         "name": "save_memory",
@@ -492,9 +526,9 @@ TOOL_DECLARATIONS = [
 ]
 
 
-class JarvisLive:
+class DexterLive:
 
-    def __init__(self, ui: JarvisUI):
+    def __init__(self, ui: DexterUI):
         self.ui             = ui
         self.session        = None
         self.audio_in_queue = None
@@ -502,7 +536,13 @@ class JarvisLive:
         self._loop          = None
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
+        self._running       = False
+        self._playback_thread = None
         self.ui.on_text_command = self._on_text_command
+        
+        # Start background wake word thread
+        self._wakeword_thread = threading.Thread(target=self._wakeword_worker, daemon=True)
+        self._wakeword_thread.start()
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -579,7 +619,7 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        print(f"[DEXTER] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
         if name == "save_memory":
             category = args.get("category", "notes")
@@ -683,7 +723,10 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
-            elif name == "shutdown_jarvis":
+            elif name == "run_terminal_command":
+                r = await loop.run_in_executor(None, lambda: run_terminal_command(parameters=args, player=self.ui))
+                result = r or "Done."
+            elif name == "shutdown_dexter":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
 
@@ -704,7 +747,7 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        print(f"[DEXTER] 📤 {name} → {str(result)[:80]}")
 
         return types.FunctionResponse(
             id=fc.id, name=name,
@@ -717,16 +760,17 @@ class JarvisLive:
             await self.session.send_realtime_input(media=msg)
 
     async def _listen_audio(self):
-        print("[JARVIS] 🎤 Mic started")
+        print("[DEXTER] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
+                dexter_speaking = self._is_speaking
+            if not dexter_speaking and not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
+                    _push_realtime_audio,
+                    self.out_queue,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
 
@@ -738,15 +782,15 @@ class JarvisLive:
                 blocksize=CHUNK_SIZE,
                 callback=callback,
             ):
-                print("[JARVIS] 🎤 Mic stream open")
+                print("[DEXTER] 🎤 Mic stream open")
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
+            print(f"[DEXTER] ❌ Mic: {e}")
             raise
 
     async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
+        print("[DEXTER] 👂 Recv started")
         out_buf, in_buf = [], []
 
         try:
@@ -754,7 +798,7 @@ class JarvisLive:
                 async for response in self.session.receive():
 
                     if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
+                        self.audio_in_queue.put(response.data)
 
                     if response.server_content:
                         sc = response.server_content
@@ -780,7 +824,7 @@ class JarvisLive:
 
                             full_out = " ".join(out_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
+                                self.ui.write_log(f"Dexter: {full_out}")
                             out_buf = []
 
                             if full_in and len(full_in) > 5:
@@ -793,7 +837,7 @@ class JarvisLive:
                     if response.tool_call:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
+                            print(f"[DEXTER] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
@@ -801,14 +845,12 @@ class JarvisLive:
                         )
 
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
+            print(f"[DEXTER] ❌ Recv: {e}")
             traceback.print_exc()
             raise
 
-    async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
-        loop = asyncio.get_event_loop()
-
+    def _play_audio_sync(self):
+        print("[DEXTER] 🔊 Play thread started")
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
@@ -817,21 +859,90 @@ class JarvisLive:
         )
         stream.start()
         try:
-            while True:
+            while self._running:
                 try:
-                    chunk = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.30)
+                    chunk = self.audio_in_queue.get(timeout=0.30)
+                    if chunk is None:
+                        break
                     self.set_speaking(True)
-                    await asyncio.to_thread(stream.write, chunk)
-                except asyncio.TimeoutError:
-                    # If no audio arrives for a short time, switch back to listening.
+                    stream.write(chunk)
+                except queue.Empty:
                     self.set_speaking(False)
         except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
+            print(f"[DEXTER] ❌ Play: {e}")
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+            print("[DEXTER] 🔊 Play thread stopped")
+
+    def _wakeword_worker(self):
+        import speech_recognition as sr
+        
+        r = sr.Recognizer()
+        r.energy_threshold = 300
+        r.dynamic_energy_threshold = True
+        
+        mic = None
+        while mic is None:
+            try:
+                mic = sr.Microphone()
+                with mic as source:
+                    r.adjust_for_ambient_noise(source, duration=1.0)
+                print("[DEXTER] 🎙 Wake word listener initialized")
+            except Exception as e:
+                print(f"[DEXTER] ⚠️ Wake word mic init failed: {e}. Retrying in 5s...")
+                time.sleep(5)
+                
+        while True:
+            if self.ui.muted:
+                try:
+                    with mic as source:
+                        audio = r.listen(source, timeout=1.5, phrase_time_limit=3.0)
+                    
+                    text = r.recognize_google(audio).lower()
+                    print(f"[DEXTER] Heard: '{text}'")
+                    if "dexter" in text:
+                        print("[DEXTER] 🔔 Wake word detected!")
+                        self._loop.call_soon_threadsafe(self._on_wake)
+                except sr.WaitTimeoutError:
+                    pass
+                except sr.UnknownValueError:
+                    pass
+                except Exception as e:
+                    print(f"[DEXTER] Wake word error: {e}")
+                    time.sleep(1)
+            else:
+                time.sleep(0.5)
+
+    def _on_wake(self):
+        self.ui.muted = False
+        self.ui.write_log("DEXTER: Yes, sir?")
+        self._play_beep()
+
+    def _play_beep(self):
+        def play():
+            try:
+                import numpy as np
+                import sounddevice as sd
+                
+                sample_rate = 24000
+                duration = 0.15
+                frequency = 880
+                t = np.linspace(0, duration, int(sample_rate * duration), False)
+                wave = np.sin(2 * np.pi * frequency * t) * 0.3
+                fade_out = np.linspace(1.0, 0.0, len(wave))
+                wave = wave * fade_out
+                audio_data = (wave * 32767).astype(np.int16)
+                sd.play(audio_data, samplerate=sample_rate)
+                sd.wait()
+            except Exception as e:
+                print(f"[DEXTER] Beep error: {e}")
+                
+        threading.Thread(target=play, daemon=True).start()
 
     async def run(self):
         client = genai.Client(
@@ -841,45 +952,55 @@ class JarvisLive:
 
         while True:
             try:
-                print("[JARVIS] 🔌 Connecting...")
+                print("[DEXTER] 🔌 Connecting...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
+                self._running = True
                 async with (
                     client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session        = session
                     self._loop          = asyncio.get_event_loop()
-                    self.audio_in_queue = asyncio.Queue()
-                    self.out_queue      = asyncio.Queue(maxsize=10)
+                    self.audio_in_queue = queue.Queue()
+                    self.out_queue      = asyncio.Queue(maxsize=15)
 
-                    print("[JARVIS] ✅ Connected.")
+                    print("[DEXTER] ✅ Connected.")
                     self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    self.ui.write_log("SYS: DEXTER online.")
+
+                    self._playback_thread = threading.Thread(target=self._play_audio_sync, daemon=True)
+                    self._playback_thread.start()
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
                     
             except Exception as e:
-                print(f"[JARVIS] ⚠️ {e}")
+                print(f"[DEXTER] ⚠️ {e}")
                 traceback.print_exc()
+            finally:
+                self._running = False
+                if hasattr(self, "audio_in_queue") and self.audio_in_queue:
+                    try:
+                        self.audio_in_queue.put(None)
+                    except Exception:
+                        pass
 
             self.set_speaking(False)
             self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
+            print("[DEXTER] 🔄 Reconnecting in 3s...")
             await asyncio.sleep(3)
 
 def main():
-    ui = JarvisUI("face.png")
+    ui = DexterUI("face.png")
 
     def runner():
         ui.wait_for_api_key()
-        jarvis = JarvisLive(ui)
+        dexter = DexterLive(ui)
         try:
-            asyncio.run(jarvis.run())
+            asyncio.run(dexter.run())
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
 

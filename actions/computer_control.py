@@ -14,7 +14,7 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
     _PYAUTOGUI = False
 
 try:
@@ -47,7 +47,7 @@ _SAFE_SCREENSHOT_ROOTS = (
 )
 
 def _safe_screenshot_path(requested: str | None) -> Path:
-    fallback = Path.home() / "Desktop" / "jarvis_screenshot.png"
+    fallback = Path.home() / "Desktop" / "dexter_screenshot.png"
     if not requested:
         return fallback
     try:
@@ -62,7 +62,10 @@ def _safe_screenshot_path(requested: str | None) -> Path:
 
 def _require_pyautogui():
     if not _PYAUTOGUI:
-        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+        raise RuntimeError(
+            "PyAutoGUI is not available. If you are on Linux, "
+            "please run 'xhost +local:' in your terminal to authorize X11 display access."
+        )
 
 _FIRST_NAMES = [
     "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Drew", "Quinn",

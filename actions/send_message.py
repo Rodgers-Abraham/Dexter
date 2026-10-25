@@ -4,11 +4,24 @@
 # hardcoded tab/click sequences — works on any screen resolution.
 
 import time
-import pyautogui
 from pathlib import Path
 
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.08
+class LazyPyAutoGUI:
+    def __getattr__(self, name):
+        try:
+            import pyautogui
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE = 0.08
+            globals()['pyautogui'] = pyautogui
+            return getattr(pyautogui, name)
+        except Exception as e:
+            raise RuntimeError(
+                "Could not initialize PyAutoGUI. If you are on Linux, "
+                "please ensure you have run 'xhost +local:' in your terminal "
+                "to authorize X11 display access. Error: " + str(e)
+            )
+
+pyautogui = LazyPyAutoGUI()
 
 def _open_app(app_name: str) -> bool:
     """Opens an app via Windows search."""
