@@ -1,4 +1,4 @@
-# 🤖 [ DEXTER ]
+# 🤖 DEXTER 
 ### The Ultimate Cross-Platform Personal AI Assistant — By Pappy
 
 
